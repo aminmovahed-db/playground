@@ -12,6 +12,7 @@ checkpoint_backup_path = "/Volumes/main/nab_shared_mode_test/checkpoints_backup"
 # COMMAND ----------
 
 dbutils.fs.rm(checkpoint_path, True)
+dbutils.fs.rm(checkpoint_backup_path, True)
 
 # COMMAND ----------
 
@@ -59,13 +60,65 @@ def upsertToDelta(microBatchOutputDF, batchId):
   """)
 
 def simulate_framework_write(df):
-    (df.writeStream
-     .trigger(once=True)
-     .option("checkpointLocation", checkpoint_path)
-     .foreachBatch(upsertToDelta)
-     .outputMode("update")
-     .start()
-    )
+      streaming_query = (df.writeStream
+                        .trigger(once=True)
+                        .option("checkpointLocation", checkpoint_path)
+                        .foreachBatch(upsertToDelta)
+                        .outputMode("update")
+                        .start()
+                        )
+      streaming_query.awaitTermination()
+
+# COMMAND ----------
+
+from pyspark.sql.functions import max, col
+def checkpoints_read(checkpoint_path):
+      max_commit = spark.read.json(f'{checkpoint_path}/commits').selectExpr('_metadata.file_name').agg(max('_metadata.file_name')).collect()[0][0]
+
+      return (spark.read
+            .json(f'{checkpoint_path}/offsets')
+            .where("reservoirId is not null")
+            .where(f"_metadata.file_name = '{max_commit}'")).withColumn("Version", col("reservoirVersion") + col("index")).selectExpr('reservoirId', 'Version','_metadata.file_name').withColumnRenamed('_metadata.file_name', 'commit_version')
+      
+
+
+def check_version(table_name):
+    return spark.sql(f"describe history {table_name}").first()["version"]
+
+# COMMAND ----------
+
+def get_max_commit(checkpoints_path):
+    return spark.read.json(f'{checkpoints_path}/commits').selectExpr('_metadata.file_name').agg(max('_metadata.file_name')).collect()[0][0]
+
+def backup_checkpoints(checkpoints_path, backup_path, max_commit):
+    
+    # Check if the checkpoint location exists
+    if not dbutils.fs.ls(checkpoints_path):
+        raise ValueError(f"Checkpoint path '{checkpoints_path}' does not exist.")
+
+    # Create the backup path if it doesn't exist
+    try:
+        dbutils.fs.ls(backup_path)
+        print(f"Backup path '{backup_path}' already exists.")
+    except Exception:
+        print(f"Backup path '{backup_path}' does not exist. Creating it.")
+        dbutils.fs.mkdirs(backup_path)
+    
+    folders_dict = {
+    "metadata": "metadata",
+    "commits": "commits",
+    "offsets": "offsets",
+    "state": f"state/state_{max_commit}"
+    }
+
+
+    for folder in folders_dict:
+        try:
+            dbutils.fs.cp(f"{checkpoints_path}/{folder}", f"{backup_path}/{folders_dict[folder]}", recurse=True)
+        except Exception as e:
+            print(f"Error copying {folder}: {e}")
+
+
 
 # COMMAND ----------
 
@@ -123,50 +176,15 @@ def simulate_framework_write(df):
 
 # COMMAND ----------
 
-# DBTITLE 1,single user mode test
 df = simulate_framework_read()
 df = df.distinct()
 simulate_framework_write(df)
-
-# COMMAND ----------
-
-dbutils.fs.ls(checkpoint_path)
-
-# COMMAND ----------
-
-dbutils.fs.head(f'{checkpoint_path}/metadata')
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC DESC detail ${db.bronze_schema}.employee;
-
-# COMMAND ----------
-
-from pyspark.sql.functions import max, col
-
-max_commit = spark.read.json(f'{checkpoint_path}/commits').selectExpr('_metadata.file_name').agg(max('_metadata.file_name')).collect()[0][0]
-
-df = (spark.read
-      .json(f'{checkpoint_path}/offsets')
-      .where("reservoirId is not null")
-      .where(f"_metadata.file_name = '{max_commit}'")).withColumn("Version", col("reservoirVersion") + col("index")).selectExpr('reservoirId', 'Version','_metadata.file_name').withColumnRenamed('_metadata.file_name', 'commit_version')
-display(df)
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC select * from main.information_schema.tables where table_name = 'employee'-- and storage_sub_directory like '%6f68dbae-4811-48d9-9f28-231c93ca113d%'
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC DESC history ${db.bronze_schema}.employee;
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC DESC detail ${db.bronze_schema}.employee_phone;
+employee_v = check_version(f"{bronze_schema}.employee")
+employee_phone_v = check_version(f"{bronze_schema}.employee_phone")
+target_v = check_version(f"{silver_schema}.target")
+print(f"Employee version: {employee_v}\nEmployee_phone version: {employee_phone_v}\nTarget version: {target_v}")
+display(checkpoints_read(checkpoint_path))
+backup_checkpoints(checkpoint_path, checkpoint_backup_path, get_max_commit(checkpoint_path))
 
 # COMMAND ----------
 
@@ -189,14 +207,21 @@ display(df)
 
 # COMMAND ----------
 
-# DBTITLE 1,shared mode cluster
+# DBTITLE 1,single user mode test
 df = simulate_framework_read()
 df = df.distinct()
 simulate_framework_write(df)
+employee_v = check_version(f"{bronze_schema}.employee")
+employee_phone_v = check_version(f"{bronze_schema}.employee_phone")
+target_v = check_version(f"{silver_schema}.target")
+print(f"Employee version: {employee_v}\nEmployee_phone version: {employee_phone_v}\nTarget version: {target_v}")
+display(checkpoints_read(checkpoint_path))
+backup_checkpoints(checkpoint_path, checkpoint_backup_path, get_max_commit(checkpoint_path))
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC select * from main.nab_shared_mode_test.target
-# MAGIC -- DROP TABLE main.nab_shared_mode_test.target
-# MAGIC -- truncate table main.nab_shared_mode_test.target
+dbutils.fs.ls(checkpoint_path)
+
+# COMMAND ----------
+
+dbutils.fs.head(f'{checkpoint_path}/metadata')

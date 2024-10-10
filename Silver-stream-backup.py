@@ -1,13 +1,22 @@
 # Databricks notebook source
-bronze_schema = f'main.nab_shared_mode_test'
-silver_schema = f'main.nab_shared_mode_test'
+catalog = 'main'
+bronze_schema = 'nab_shared_mode_test'
+silver_schema = 'nab_shared_mode_test'
 
-spark.conf.set ('db.bronze_schema', bronze_schema)
-spark.conf.set ('db.silver_schema', silver_schema)
+spark.conf.set ('db.bronze_schema', f'{catalog}.{bronze_schema}')
+spark.conf.set ('db.silver_schema', f'{catalog}.{silver_schema}')
 
 spark.conf.set("spark.databricks.analyzer.noSyncIsStreamingToCteReference", "true")
-checkpoint_path = '/Volumes/main/nab_shared_mode_test/checkpoints'
-checkpoint_backup_path = "/Volumes/main/nab_shared_mode_test/checkpoints_backup"
+checkpoint_path = f'/Volumes/{catalog}/{bronze_schema}/checkpoints'
+checkpoint_backup_path = f"/Volumes/{catalog}/{bronze_schema}/checkpoints_backup"
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC CREATE SCHEMA IF NOT EXISTS ${db.bronze_schema};
+# MAGIC CREATE SCHEMA IF NOT EXISTS ${db.silver_schema};
+# MAGIC CREATE VOLUME IF NOT EXISTS ${db.bronze_schema}.checkpoints;
+# MAGIC CREATE VOLUME IF NOT EXISTS ${db.bronze_schema}.checkpoints_backup;
 
 # COMMAND ----------
 
@@ -52,7 +61,7 @@ def simulate_framework_read():
 def upsertToDelta(microBatchOutputDF, batchId):
   microBatchOutputDF.createOrReplaceTempView("updates")
   microBatchOutputDF.sparkSession.sql("""
-    MERGE INTO main.nab_shared_mode_test.target t
+    MERGE INTO ${db.silver_schema}.target t
     USING updates s
     ON s.emp_id = t.emp_id
     WHEN MATCHED THEN UPDATE SET *
@@ -122,9 +131,18 @@ def backup_checkpoints(checkpoints_path, backup_path, max_commit):
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC CREATE SCHEMA IF NOT EXISTS ${db.bronze_schema};
-# MAGIC CREATE SCHEMA IF NOT EXISTS ${db.silver_schema};
+def run_pipeline():
+    df = simulate_framework_read()
+    df = df.distinct()
+    simulate_framework_write(df)
+    
+def run_backup():
+    employee_v = check_version(f"{bronze_schema}.employee")
+    employee_phone_v = check_version(f"{bronze_schema}.employee_phone")
+    target_v = check_version(f"{silver_schema}.target")
+    print(f"Employee version: {employee_v}\nEmployee_phone version: {employee_phone_v}\nTarget version: {target_v}")
+    display(checkpoints_read(checkpoint_path))
+    backup_checkpoints(checkpoint_path, checkpoint_backup_path, get_max_commit(checkpoint_path))
 
 # COMMAND ----------
 
@@ -176,15 +194,8 @@ def backup_checkpoints(checkpoints_path, backup_path, max_commit):
 
 # COMMAND ----------
 
-df = simulate_framework_read()
-df = df.distinct()
-simulate_framework_write(df)
-employee_v = check_version(f"{bronze_schema}.employee")
-employee_phone_v = check_version(f"{bronze_schema}.employee_phone")
-target_v = check_version(f"{silver_schema}.target")
-print(f"Employee version: {employee_v}\nEmployee_phone version: {employee_phone_v}\nTarget version: {target_v}")
-display(checkpoints_read(checkpoint_path))
-backup_checkpoints(checkpoint_path, checkpoint_backup_path, get_max_commit(checkpoint_path))
+run_pipeline()
+run_backup()
 
 # COMMAND ----------
 
@@ -208,20 +219,5 @@ backup_checkpoints(checkpoint_path, checkpoint_backup_path, get_max_commit(check
 # COMMAND ----------
 
 # DBTITLE 1,single user mode test
-df = simulate_framework_read()
-df = df.distinct()
-simulate_framework_write(df)
-employee_v = check_version(f"{bronze_schema}.employee")
-employee_phone_v = check_version(f"{bronze_schema}.employee_phone")
-target_v = check_version(f"{silver_schema}.target")
-print(f"Employee version: {employee_v}\nEmployee_phone version: {employee_phone_v}\nTarget version: {target_v}")
-display(checkpoints_read(checkpoint_path))
-backup_checkpoints(checkpoint_path, checkpoint_backup_path, get_max_commit(checkpoint_path))
-
-# COMMAND ----------
-
-dbutils.fs.ls(checkpoint_path)
-
-# COMMAND ----------
-
-dbutils.fs.head(f'{checkpoint_path}/metadata')
+run_pipeline()
+run_backup()

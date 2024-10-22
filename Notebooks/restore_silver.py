@@ -1,7 +1,6 @@
 """Module providing a function printing python version."""
 
 import json
-import functools
 from datetime import datetime
 
 from databricks.connect import DatabricksSession
@@ -11,54 +10,42 @@ from pyspark.sql import Row
 from pyspark.sql import types as T
 from pyspark.sql.utils import AnalysisException
 
-
 spark = DatabricksSession.builder.getOrCreate()
 dbutils = DBUtils(spark)
 
 
 class RestoreSilver:
+    """
+    A class to handle the restoration of Delta tables to a specific version,
+    including checkpoint management.
+
+    Attributes:
+        spark (SparkSession): The Spark session.
+        table_catalog (str): The catalog of the table.
+        dr_table_catalog (str): The disaster recovery catalog of the table.
+        table_schema (str): The schema of the table.
+        table_name (str): The name of the table.
+        version (int): The version of the table to restore.
+        use_checkpoints (bool): Flag indicating whether to use checkpoints.
+        audit_df (DataFrame): DataFrame containing audit table information.
+        source_info (dict): Information about the source.
+        table_info (dict): Information about the table.
+        batch (bool): Flag indicating whether the table is a batch table.
+
+    Methods:
+        revert_table():
+            Reverts the table to the specified version or restores from a
+            backup if the version is not available.
+
+        revert_checkpoints():
+            Reverts the streaming checkpoints if applicable.
+
+        generate_output_config():
+            Generates the output configuration for the restored table.
+    """
 
     def __init__(self, spark_session, json_payload, audit_table):
         self.spark = spark_session
-        self._read_config(json_payload)
-        self.audit_df = self._read_audit_table(audit_table)
-        self.source_info = self._get_source_info()
-        self.table_info = self._get_table_info()
-        self.batch = self.table_info.get("batch") == "true"
-
-    def show_config(self):
-        print(f"table_catalog: {self.table_catalog}")
-        print(f"table_schema: {self.table_schema}")
-        print(f"table_name: {self.table_name}")
-        print(f"version: {self.version}")
-        print(f"use_checkpoints: {self.use_checkpoints}")
-
-    @functools.lru_cache(maxsize=1)
-    def _table_history(self):
-        return self.spark.sql(
-            f"DESCRIBE HISTORY {self.table_catalog}.{self.table_schema}.{self.table_name}"
-        ).select("version", "timestamp")
-
-    def _show(self, df):
-        df.show()
-
-    def _display(self, df):
-        pandas_df = df.toPandas()
-        print(pandas_df)
-
-    def show_table_history(self):
-        self._show(self._table_history())
-
-    def display_table_history(self):
-        self._display(self._table_history())
-
-    def _read_json(self, json_payload):
-        try:
-            return json.loads(json_payload)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Error decoding JSON: {e}") from e
-
-    def _read_config(self, json_payload):
         config = self._read_json(json_payload)
         self.table_catalog = config.get("table_catalog")
         self.dr_table_catalog = config.get("dr_table_catalog")
@@ -66,6 +53,16 @@ class RestoreSilver:
         self.table_name = config.get("table_name")
         self.version = int(config.get("version"))
         self.use_checkpoints = config.get("use_checkpoints").lower() == "true"
+        self.audit_df = self._read_audit_table(audit_table)
+        self.source_info = self._get_source_info(self.audit_df)
+        self.table_info = self._get_table_info(self.audit_df)
+        self.batch = self.table_info.get("batch") == "true"
+
+    def _read_json(self, json_payload):
+        try:
+            return json.loads(json_payload)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Error decoding JSON: {e}") from e
 
     def _read_audit_table(self, audit_table):
         return self.spark.read.table(audit_table).filter(
@@ -76,15 +73,26 @@ class RestoreSilver:
         try:
             self.spark.read.format("delta").option("versionAsOf", version_number).table(
                 table_full_name
-            ).limit(1)
+            ).limit(1).count()
             return True
 
-        except AnalysisException as e:
-            if "Cannot time travel Delta table to version" in str(e):
+        except Exception as e:
+            if "[DELTA_FILE_NOT_FOUND_DETAILED]" in str(e):
                 return False
-            raise e
+            else:
+                raise e
 
     def revert_table(self):
+        """
+        Reverts the table to a specified version or restores it from a backup version.
+        This method attempts to revert the table to the specified version if available.
+        If the specified version is not available, it will attempt to restore the table
+        from a backup version. If neither the specified version nor the backup version
+        is available, a RuntimeError is raised.
+        Raises:
+            RuntimeError: If neither the specified version nor the backup version is available.
+        """
+
         table_full_name = f"{self.table_catalog}.{self.table_schema}.{self.table_name}"
         backup_version = self._get_backup_version()
 
@@ -141,15 +149,26 @@ class RestoreSilver:
             )
         return backup_version_row[0]
 
-    def _get_source_info(self):
-        source_info = self.audit_df.select("source_info").first()[0]
+    def _get_source_info(self, df):
+        source_info = df.select("source_info").first()[0]
         return self._read_json(source_info)
 
-    def _get_table_info(self):
-        table_info = self.audit_df.select("table_info").first()[0]
+    def _get_table_info(self, df):
+        table_info = df.select("table_info").first()[0]
         return self._read_json(table_info)
 
     def revert_checkpoints(self):
+        """
+        Reverts the streaming checkpoints if the batch flag is not set.
+        This method checks if the `batch` attribute is set. If it is, it skips
+        the checkpoint restoration process and prints a message indicating that
+        checkpoint restoration is being skipped for batch tables. If the `batch`
+        attribute is not set, it attempts to revert the streaming checkpoints
+        and prints a message indicating the attempt.
+        Returns:
+            None
+        """
+
         if self.batch:
             print("Skipping checkpoint restoration for batch tables")
             return
@@ -206,6 +225,24 @@ class RestoreSilver:
             self._restore_checkpoints(reset=True)
 
     def generate_output_config(self):
+        """
+        Generates a JSON string representing the output configuration for the table.
+        The output configuration includes the table's catalog, schema, and name,
+        as well as filtered source information based on the context (batch or checkpoint usage).
+        Returns:
+            str: A JSON string representing the output configuration.
+        The method performs the following:
+        - If `self.batch` is True, it returns a JSON string with the table
+          information and a note indicating it was run as a batch table.
+        - If `self.use_checkpoints` is True, it returns a JSON string with the
+          table information and filtered source information
+          containing only the keys: "source_type", "files", "sources", and "table".
+        - Otherwise, it returns a JSON string with the table information and filtered
+          source information containing the keys:
+          "source_type", "files", "sources", "table", and "version".
+        The filtering of source information is done recursively using the `recursive_filter`
+        function.
+        """
 
         def recursive_filter(d, keys):
             if isinstance(d, dict):
@@ -240,8 +277,9 @@ class RestoreSilver:
         )
 
 
-def create_audit_table(audit_table):
-    # for testing purposes
+# for testing purposes
+def create_audit_table(audit_table):  # pylint: disable=missing-function-docstring
+
     schema = T.StructType(
         [
             T.StructField("layer", T.StringType(), True),
@@ -289,24 +327,6 @@ def create_audit_table(audit_table):
                 {
                     "commit": "delta",
                     "file_name": "file_1.sql",
-                    "cp_path": "/Volumes/main/nab_shared_mode_test/checkpoints",
-                    "incr_type": "multi",
-                    "sources": [
-                        {
-                            "table": "main.nab_shared_mode_test.employee",
-                            "table_id": "646f1a23-4c5d-4449-8acc-959e5a525887",
-                            "version": "delta",
-                        },
-                        {
-                            "table": "main.nab_shared_mode_test.employee_phone",
-                            "table_id": "ce09ac30-7dde-4dde-b114-63433a674100",
-                            "version": "delta",
-                        },
-                    ],
-                },
-                {
-                    "commit": "delta",
-                    "file_name": "file_2.sql",
                     "cp_path": "/Volumes/main/nab_shared_mode_test/checkpoints",
                     "incr_type": "multi",
                     "sources": [
@@ -396,12 +416,15 @@ if __name__ == "__main__":
         "table_schema": "nab_shared_mode_test",
         "table_catalog": "main",
         "dr_table_catalog": "main",
-        "version": "1",
+        "version": "3",
         "use_checkpoints": "false"
     }
     """
     AUDIT_TBL = "main.nab_shared_mode_test.audit"
 
-    # create_audit_table(AUDIT_TBL)
+    create_audit_table(AUDIT_TBL)
 
     restore_silver = RestoreSilver(spark, JSON_PAYLOAD, AUDIT_TBL)
+    restore_silver.revert_table()
+    # restore_silver.revert_checkpoints()
+    # restore_silver.generate_output_config()

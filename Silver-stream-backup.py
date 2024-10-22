@@ -25,11 +25,13 @@ dbutils.fs.rm(checkpoint_backup_path, True)
 
 # COMMAND ----------
 
+from pyspark.sql.functions import max, col
+
 def simulate_framework_read():
-    emp_df = spark.readStream.table(f"{bronze_schema}.employee")
+    emp_df = spark.readStream.table(f"{catalog}.{bronze_schema}.employee")
     emp_df.createOrReplaceGlobalTempView("employee")
 
-    mgr_df = spark.readStream.table(f"{bronze_schema}.employee_phone")
+    mgr_df = spark.readStream.table(f"{catalog}.{bronze_schema}.employee_phone")
     mgr_df.createOrReplaceGlobalTempView("employee_phone")
 
     return spark.sql("""
@@ -58,29 +60,31 @@ def simulate_framework_read():
                      FROM src_raw src
                   """)
 
-def upsertToDelta(microBatchOutputDF, batchId):
-  microBatchOutputDF.createOrReplaceTempView("updates")
-  microBatchOutputDF.sparkSession.sql("""
-    MERGE INTO ${db.silver_schema}.target t
-    USING updates s
-    ON s.emp_id = t.emp_id
-    WHEN MATCHED THEN UPDATE SET *
-    WHEN NOT MATCHED THEN INSERT *
-  """)
+def upsertToDelta(target_table):
+    def _upsertToDelta(microBatchOutputDF, batchId):
+        microBatchOutputDF.createOrReplaceTempView("updates")
+        microBatchOutputDF.sparkSession.sql(f"""
+            MERGE INTO {target_table} t
+            USING updates s
+            ON s.emp_id = t.emp_id
+            WHEN MATCHED THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+        """)
+    return _upsertToDelta
 
-def simulate_framework_write(df):
+
+def simulate_framework_write(df, target_table):
       streaming_query = (df.writeStream
                         .trigger(once=True)
                         .option("checkpointLocation", checkpoint_path)
-                        .foreachBatch(upsertToDelta)
+                        .foreachBatch(upsertToDelta(target_table))
                         .outputMode("update")
                         .start()
                         )
       streaming_query.awaitTermination()
 
-# COMMAND ----------
 
-from pyspark.sql.functions import max, col
+
 def checkpoints_read(checkpoint_path):
       max_commit = spark.read.json(f'{checkpoint_path}/commits').selectExpr('_metadata.file_name').agg(max('_metadata.file_name')).collect()[0][0]
 
@@ -93,8 +97,6 @@ def checkpoints_read(checkpoint_path):
 
 def check_version(table_name):
     return spark.sql(f"describe history {table_name}").first()["version"]
-
-# COMMAND ----------
 
 def get_max_commit(checkpoints_path):
     return spark.read.json(f'{checkpoints_path}/commits').selectExpr('_metadata.file_name').agg(max('_metadata.file_name')).collect()[0][0]
@@ -127,21 +129,22 @@ def backup_checkpoints(checkpoints_path, backup_path, max_commit):
         except Exception as e:
             print(f"Error copying {folder}: {e}")
 
+def backup_table(table_name):
+    spark.sql(f"CREATE OR REPLACE TABLE {table_name}_backup DEEP CLONE {table_name};")
 
 
-# COMMAND ----------
-
-def run_pipeline():
+def run_pipeline(target_table):
     df = simulate_framework_read()
     df = df.distinct()
-    simulate_framework_write(df)
+    simulate_framework_write(df, target_table)
     
 def run_backup():
-    employee_v = check_version(f"{bronze_schema}.employee")
-    employee_phone_v = check_version(f"{bronze_schema}.employee_phone")
-    target_v = check_version(f"{silver_schema}.target")
+    employee_v = check_version(f"{catalog}.{bronze_schema}.employee")
+    employee_phone_v = check_version(f"{catalog}.{bronze_schema}.employee_phone")
+    target_v = check_version(f"{catalog}.{silver_schema}.target")
     print(f"Employee version: {employee_v}\nEmployee_phone version: {employee_phone_v}\nTarget version: {target_v}")
     display(checkpoints_read(checkpoint_path))
+    backup_table(f"{catalog}.{silver_schema}.target")
     backup_checkpoints(checkpoint_path, checkpoint_backup_path, get_max_commit(checkpoint_path))
 
 # COMMAND ----------
@@ -171,6 +174,8 @@ def run_backup():
 # MAGIC   PHONE string,
 # MAGIC   EXTRACT_DTTM timestamp)
 # MAGIC TBLPROPERTIES (delta.enableChangeDataFeed = true);
+# MAGIC
+# MAGIC DROP TABLE IF EXISTS ${db.silver_schema}.target_backup;
 
 # COMMAND ----------
 
@@ -194,8 +199,12 @@ def run_backup():
 
 # COMMAND ----------
 
-run_pipeline()
+run_pipeline(f"{catalog}.{silver_schema}.target")
 run_backup()
+
+# COMMAND ----------
+
+spark.sql(f"optimize {catalog}.{silver_schema}.target")
 
 # COMMAND ----------
 
@@ -219,5 +228,61 @@ run_backup()
 # COMMAND ----------
 
 # DBTITLE 1,single user mode test
-run_pipeline()
+run_pipeline(f"{catalog}.{silver_schema}.target")
 run_backup()
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC INSERT INTO TABLE ${db.bronze_schema}.employee (
+# MAGIC   EMP_ID,
+# MAGIC   EMP_NAME,
+# MAGIC   EMP_BATCH_NO,
+# MAGIC   MANAGER_ID,
+# MAGIC   EXTRACT_DTTM)
+# MAGIC VALUES
+# MAGIC   ('E3', 'E3-Name', 'B3-E3-1111', 'M3', '2024-01-10 00:00:00');
+# MAGIC
+# MAGIC -- INSERT INTO TABLE ${db.bronze_schema}.employee_phone (
+# MAGIC --   EMP_ID,
+# MAGIC --   PHONE,
+# MAGIC --   EXTRACT_DTTM)
+# MAGIC -- VALUES
+# MAGIC --   ('E2', '0422222222', '2024-01-02 00:00:00');
+
+# COMMAND ----------
+
+run_pipeline(f"{catalog}.{silver_schema}.target")
+run_backup()
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT * FROM ${db.silver_schema}.target;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC INSERT INTO TABLE ${db.bronze_schema}.employee_phone (
+# MAGIC   EMP_ID,
+# MAGIC   PHONE,
+# MAGIC   EXTRACT_DTTM)
+# MAGIC VALUES
+# MAGIC   ('E3', '043455432454', '2024-01-12 00:00:00');
+
+# COMMAND ----------
+
+run_pipeline(f"{catalog}.{silver_schema}.target")
+run_backup()
+
+# COMMAND ----------
+
+spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
+
+spark.sql("VACUUM main.nab_shared_mode_test.target RETAIN 0 HOURS;")
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT * FROM main.nab_shared_mode_test.target VERSION AS OF 20;
+# MAGIC -- SELECT * FROM main.nab_shared_mode_test.target ;
